@@ -277,6 +277,7 @@ module.exports = async (req, res) => {
       console.error('Unable to resolve target location id');
       return res.status(500).send('No target location available');
     }
+    console.log(`Using target location ${targetLocationId} on ${target.label} (${target.storeDomain})`);
 
     // Process per-SKU adjustments with limited concurrency to fit time budgets
     const doAdjustForSkuQuantity = async (sku, qty) => {
@@ -296,7 +297,7 @@ module.exports = async (req, res) => {
         return;
       }
       const adjustment = adjustmentSign * Math.abs(qty);
-      await adjustInventory({
+      const adjustResponse = await adjustInventory({
         storeDomain: target.storeDomain,
         apiVersion: target.apiVersion,
         token: target.token,
@@ -304,7 +305,10 @@ module.exports = async (req, res) => {
         locationId: targetLocationId,
         adjustment,
       });
-      console.log(`Adjusted inventory for SKU ${sku} by ${adjustment} in ${target.label} due to ${normalizedTopic}`);
+      const newAvailable = adjustResponse && adjustResponse.inventory_level && typeof adjustResponse.inventory_level.available === 'number'
+        ? adjustResponse.inventory_level.available
+        : undefined;
+      console.log(`Adjusted inventory for SKU ${sku} by ${adjustment} in ${target.label} due to ${normalizedTopic}` + (newAvailable !== undefined ? `; new available: ${newAvailable}` : ''));
     };
 
     const entries = Object.entries(skuToQuantity);
