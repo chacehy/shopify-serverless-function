@@ -165,6 +165,8 @@ module.exports = async (req, res) => {
   const b2bDomain = (process.env.B2B_SHOPIFY_STORE_URL || '').toLowerCase();
   const b2cSecret = process.env.B2C_SHOPIFY_API_SECRET;
   const b2bSecret = process.env.B2B_SHOPIFY_API_SECRET;
+  const b2cWebhookSecret = process.env.B2C_SHOPIFY_WEBHOOK_SECRET || b2cSecret;
+  const b2bWebhookSecret = process.env.B2B_SHOPIFY_WEBHOOK_SECRET || b2bSecret;
   const b2cToken = process.env.B2C_SHOPIFY_ADMIN_API_TOKEN;
   const b2bToken = process.env.B2B_SHOPIFY_ADMIN_API_TOKEN;
   const b2cApiVersion = process.env.B2C_SHOPIFY_API_VERSION || '2023-04';
@@ -190,15 +192,15 @@ module.exports = async (req, res) => {
   const incomingShop = (shop || '').toLowerCase();
 
   let sourceStore = null; // 'b2c' or 'b2b'
-  if (incomingShop === b2cDomain && isValidShopifyHmac(rawBody, hmacHeader, b2cSecret)) {
+  if (incomingShop === b2cDomain && isValidShopifyHmac(rawBody, hmacHeader, b2cWebhookSecret)) {
     sourceStore = 'b2c';
-  } else if (incomingShop === b2bDomain && isValidShopifyHmac(rawBody, hmacHeader, b2bSecret)) {
+  } else if (incomingShop === b2bDomain && isValidShopifyHmac(rawBody, hmacHeader, b2bWebhookSecret)) {
     sourceStore = 'b2b';
   } else {
     // Fallback: try both secrets in case domain header is unexpected
-    if (isValidShopifyHmac(rawBody, hmacHeader, b2cSecret)) {
+    if (isValidShopifyHmac(rawBody, hmacHeader, b2cWebhookSecret)) {
       sourceStore = 'b2c';
-    } else if (isValidShopifyHmac(rawBody, hmacHeader, b2bSecret)) {
+    } else if (isValidShopifyHmac(rawBody, hmacHeader, b2bWebhookSecret)) {
       sourceStore = 'b2b';
     }
   }
