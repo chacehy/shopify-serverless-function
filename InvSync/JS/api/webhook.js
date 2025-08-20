@@ -113,6 +113,59 @@ function shopifyRequestJSON({
   });
 }
 
+/**
+ * Minimal HTTPS GraphQL client for Shopify Admin API.
+ */
+function shopifyRequestGraphQL({ storeDomain, apiVersion, token, query, variables = undefined }) {
+  return new Promise((resolve, reject) => {
+    const requestPath = `/admin/api/${apiVersion}/graphql.json`;
+    const options = {
+      hostname: storeDomain,
+      method: 'POST',
+      path: requestPath,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': token,
+      },
+      agent: keepAliveAgent,
+    };
+    const req = https.request(options, (res) => {
+      const statusCode = res.statusCode || 0;
+      const chunks = [];
+      res.on('data', (d) => chunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+      res.on('end', () => {
+        const responseBuffer = Buffer.concat(chunks);
+        const text = responseBuffer.toString('utf8');
+        let parsed;
+        try {
+          parsed = text ? JSON.parse(text) : {};
+        } catch (e) {
+          return reject(new Error(`Failed to parse GraphQL JSON response (${statusCode}): ${text}`));
+        }
+        if (statusCode >= 200 && statusCode < 300) {
+          if (parsed && parsed.errors) {
+            const error = new Error(`Shopify GraphQL errors: ${JSON.stringify(parsed.errors)}`);
+            error.body = parsed;
+            return reject(error);
+          }
+          return resolve(parsed);
+        } else {
+          const error = new Error(`Shopify API POST ${requestPath} failed (${statusCode}): ${text}`);
+          error.statusCode = statusCode;
+          error.body = parsed;
+          return reject(error);
+        }
+      });
+    });
+    req.setTimeout(requestTimeoutMs, () => {
+      req.destroy(new Error(`Request timed out after ${requestTimeoutMs}ms`));
+    });
+    req.on('error', (err) => reject(err));
+    req.write(JSON.stringify({ query, variables }));
+    req.end();
+  });
+}
+
 async function findVariantBySku({ storeDomain, apiVersion, token, sku }) {
   const response = await shopifyRequestJSON({
     storeDomain,
@@ -124,6 +177,33 @@ async function findVariantBySku({ storeDomain, apiVersion, token, sku }) {
   });
   const variants = response.variants || [];
   return variants.length > 0 ? variants[0] : null;
+}
+
+function escapeForQuery(value) {
+  return String(value || '').replace(/"/g, '\\"').trim();
+}
+
+async function findVariantByTitles({ storeDomain, apiVersion, token, productTitle, variantTitle }) {
+  const productTitleEscaped = escapeForQuery(productTitle);
+  const variantTitleEscaped = escapeForQuery(variantTitle);
+  const parts = [];
+  if (productTitleEscaped) parts.push(`product_title:\"${productTitleEscaped}\"`);
+  if (variantTitleEscaped) parts.push(`title:\"${variantTitleEscaped}\"`);
+  const searchQuery = parts.join(' AND ');
+  const query = `query($first:Int!, $query:String!){\n    productVariants(first:$first, query:$query){\n      edges{ node{ id title sku product{ title } inventoryItem{ id } } }\n    }\n  }`;
+  const resp = await shopifyRequestGraphQL({
+    storeDomain,
+    apiVersion,
+    token,
+    query,
+    variables: { first: 10, query: searchQuery },
+  });
+  const edges = resp && resp.data && resp.data.productVariants && resp.data.productVariants.edges ? resp.data.productVariants.edges : [];
+  if (!edges.length) return null;
+  const node = edges[0].node;
+  const invGid = node && node.inventoryItem && node.inventoryItem.id;
+  const inventoryItemId = invGid ? String(invGid).split('/').pop() : null;
+  return inventoryItemId ? { inventory_item_id: Number(inventoryItemId) } : null;
 }
 
 async function getDefaultLocationId({ storeDomain, apiVersion, token }) {
@@ -248,18 +328,20 @@ module.exports = async (req, res) => {
         label: 'b2c',
       };
 
-  // Aggregate quantities per SKU to minimize API calls
-  const skuToQuantity = {};
+  // Aggregate quantities per product/variant titles to minimize API calls
+  const titleToQuantity = {};
   const lineItems = Array.isArray(payload && payload.line_items) ? payload.line_items : [];
   for (const item of lineItems) {
-    const sku = (item && item.sku) || '';
+    const productTitle = (item && item.title) || '';
+    const variantTitle = (item && item.variant_title) || '';
     const quantity = Number(item && item.quantity) || 0;
-    if (!sku || quantity <= 0) continue;
-    skuToQuantity[sku] = (skuToQuantity[sku] || 0) + quantity;
+    if (!productTitle || quantity <= 0) continue;
+    const key = `${productTitle}||${variantTitle}`;
+    titleToQuantity[key] = (titleToQuantity[key] || 0) + quantity;
   }
 
-  if (Object.keys(skuToQuantity).length === 0) {
-    console.log('No SKUs with quantity to adjust.');
+  if (Object.keys(titleToQuantity).length === 0) {
+    console.log('No line items with quantity to adjust.');
     return res.status(200).send('OK');
   }
 
@@ -279,21 +361,22 @@ module.exports = async (req, res) => {
     }
     console.log(`Using target location ${targetLocationId} on ${target.label} (${target.storeDomain})`);
 
-    // Process per-SKU adjustments with limited concurrency to fit time budgets
-    const doAdjustForSkuQuantity = async (sku, qty) => {
-      const variant = await findVariantBySku({
+    // Process per-title adjustments with limited concurrency to fit time budgets
+    const doAdjustForTitles = async (productTitle, variantTitle, qty) => {
+      const variant = await findVariantByTitles({
         storeDomain: target.storeDomain,
         apiVersion: target.apiVersion,
         token: target.token,
-        sku,
+        productTitle,
+        variantTitle,
       });
       if (!variant) {
-        console.warn(`No matching variant found in ${target.label} for SKU ${sku}`);
+        console.warn(`No matching variant found in ${target.label} for product title "${productTitle}" variant title "${variantTitle}"`);
         return;
       }
       const inventoryItemId = variant.inventory_item_id;
       if (!inventoryItemId) {
-        console.warn(`Variant for SKU ${sku} has no inventory_item_id in ${target.label}`);
+        console.warn(`Variant for product title "${productTitle}" variant title "${variantTitle}" has no inventory_item_id in ${target.label}`);
         return;
       }
       const adjustment = adjustmentSign * Math.abs(qty);
@@ -308,20 +391,21 @@ module.exports = async (req, res) => {
       const newAvailable = adjustResponse && adjustResponse.inventory_level && typeof adjustResponse.inventory_level.available === 'number'
         ? adjustResponse.inventory_level.available
         : undefined;
-      console.log(`Adjusted inventory for SKU ${sku} by ${adjustment} in ${target.label} due to ${normalizedTopic}` + (newAvailable !== undefined ? `; new available: ${newAvailable}` : ''));
+      console.log(`Adjusted inventory for product "${productTitle}" variant "${variantTitle || 'Default'}" by ${adjustment} in ${target.label} due to ${normalizedTopic}` + (newAvailable !== undefined ? `; new available: ${newAvailable}` : ''));
     };
 
-    const entries = Object.entries(skuToQuantity);
+    const entries = Object.entries(titleToQuantity);
     const concurrencyLimit = Math.max(1, Math.min(entries.length, Number(process.env.INVENTORY_ADJUST_CONCURRENCY || 5)));
     let cursor = 0;
     const runners = Array.from({ length: concurrencyLimit }, async () => {
       while (cursor < entries.length) {
         const myIndex = cursor++;
-        const [sku, qty] = entries[myIndex];
+        const [key, qty] = entries[myIndex];
+        const [productTitle, variantTitle] = String(key).split('||');
         try {
-          await doAdjustForSkuQuantity(sku, qty);
+          await doAdjustForTitles(productTitle, variantTitle, qty);
         } catch (err) {
-          console.error(`Failed to adjust inventory for SKU ${sku} in ${target.label}`, err && err.body ? err.body : err);
+          console.error(`Failed to adjust inventory for product "${productTitle}" variant "${variantTitle}" in ${target.label}`, err && err.body ? err.body : err);
         }
       }
     });
